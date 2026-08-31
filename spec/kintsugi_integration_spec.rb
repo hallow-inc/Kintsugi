@@ -125,6 +125,51 @@ shared_examples "tests" do |git_command, project_name|
       expect(`git -C #{git_directory_path} diff --name-only --diff-filter=U`.chomp)
         .to eq("#{project_name}/project.pbxproj")
     end
+
+    it "resolves conflicts when adding a file system synchronized root group" do
+      File.write(File.join(git_directory_path, ".gitattributes"), "*.pbxproj merge=Unset")
+
+      project = create_new_project_at_path(File.join(git_directory_path, project_name))
+
+      git.add(File.join(git_directory_path, ".gitattributes"))
+      git.add(project.path)
+      git.commit("Initial project")
+
+      # A buildable folder, as created by Xcode 16: a `PBXFileSystemSynchronizedRootGroup` that
+      # lives in the main group and is referenced by the target. Before this feature, merging any
+      # conflict on such a project failed with "Trying to add unsupported component type
+      # PBXFileSystemSynchronizedRootGroup".
+      target = project.new_target("com.apple.product-type.library.static", "foo", :ios)
+      group = project.new(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+      group.source_tree = "<group>"
+      group.path = "SyncedSources"
+      project.main_group.children << group
+      target.file_system_synchronized_groups << group
+      project.save
+
+      git.add(all: true)
+      git.commit("Add target foo with a buildable folder")
+      first_commit_hash = git.revparse("HEAD")
+
+      git.checkout("HEAD^")
+      project = Xcodeproj::Project.open(project.path)
+      project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      project.save
+      git.add(all: true)
+      git.commit("Add target bar")
+
+      `git -C #{git_directory_path} #{git_command} #{first_commit_hash} &> /dev/null`
+      Kintsugi.run([File.join(project.path, "project.pbxproj")])
+
+      project = Xcodeproj::Project.open(project.path)
+      synchronized_groups = project.objects.select do |object|
+        object.isa == "PBXFileSystemSynchronizedRootGroup"
+      end
+      expect(project.targets.map(&:display_name)).to contain_exactly("foo", "bar")
+      expect(synchronized_groups.count).to eq(1)
+      expect(project.targets.find { |native_target| native_target.display_name == "foo" }
+                    .file_system_synchronized_groups.first).to equal(synchronized_groups.first)
+    end
   end
 
   def make_temp_directory

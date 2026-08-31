@@ -24,6 +24,12 @@ end
 
 module Kintsugi
   class << self
+    # Isas of components whose additions and removals are handled by the main group pipeline
+    # (`apply_group_additions`/`apply_group_removals`). `PBXFileSystemSynchronizedRootGroup` is the
+    # Xcode 16 "buildable folder" object, which lives in the group tree like a group.
+    GROUP_PIPELINE_ISAS =
+      %w[PBXGroup PBXVariantGroup PBXFileSystemSynchronizedRootGroup].freeze
+
     # Applies the change specified by `change` to `project`.
     #
     # @param  [Xcodeproj::Project] project
@@ -45,6 +51,7 @@ module Kintsugi
       @change_source_project = change_source_project
       @ignored_components_group_paths = []
       @created_components_group_paths = []
+      @pending_exception_references = []
 
       # We iterate over the main group and project references first because they might create file
       # or project references that are referenced in other parts.
@@ -65,6 +72,11 @@ module Kintsugi
                                 change["rootObject"].reject { |key|
                                   %w[mainGroup projectReferences].include?(key)
                                 }, "")
+
+      # Exception sets reference targets and build phases that may only be created later in the
+      # change (and groups are linked to their targets only in the rootObject pass above), so their
+      # references are resolved here, once everything exists.
+      resolve_pending_exception_references
     end
 
     private
@@ -107,7 +119,7 @@ module Kintsugi
 
     def apply_group_additions(project, additions, force_create_containing_group: false)
       additions.each do |change, path|
-        next unless %w[PBXGroup PBXVariantGroup].include?(change["isa"])
+        next unless GROUP_PIPELINE_ISAS.include?(change["isa"])
 
         group_type = Module.const_get("Xcodeproj::Project::#{change["isa"]}")
         containing_group = project.group_or_file_at_path(path)
@@ -244,7 +256,8 @@ module Kintsugi
       when Xcodeproj::Project::PBXFileReference
         apply_file_changes(project, [[component_change, containing_group_path]], [],
                            force_create_containing_group: true)
-      when Xcodeproj::Project::PBXGroup
+      when Xcodeproj::Project::PBXGroup,
+           Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup
         apply_group_additions(project, [[component_change, containing_group_path]],
                               force_create_containing_group: true)
       else
@@ -256,14 +269,16 @@ module Kintsugi
 
     def apply_group_removals(project, removals)
       removals.sort_by(&:last).reverse.each do |change, path|
-        next unless %w[PBXGroup PBXVariantGroup].include?(change["isa"])
+        next unless GROUP_PIPELINE_ISAS.include?(change["isa"])
 
         group_path = join_path(path, change["displayName"])
 
         # by now we've deleted all of this group's children in the project, so we need to adapt the
         # change to the expected current state of the group, that is, without any children.
+        # `PBXFileSystemSynchronizedRootGroup` has no `children` attribute, so we must not inject an
+        # empty one, otherwise `remove_component`'s tree hash comparison would never match.
         change_without_children = change.dup
-        change_without_children["children"] = []
+        change_without_children["children"] = [] if change.key?("children")
 
         remove_component(project[group_path], change_without_children)
       end
@@ -291,12 +306,7 @@ module Kintsugi
       if change[:removed].is_a?(Hash)
         remove_component(component, change[:removed])
       elsif change[:removed].is_a?(Array)
-        unless component.nil?
-          (change[:removed]).each do |removed_change|
-            child = child_component_of_object_list(component, removed_change["displayName"])
-            remove_component(child, removed_change)
-          end
-        end
+        remove_children_from_object_list(component, change[:removed]) unless component.nil?
       elsif !change[:removed].nil?
         raise MergeError, "Unsupported removed change type for #{change[:removed]}"
       end
@@ -320,6 +330,22 @@ module Kintsugi
         end
 
         apply_change_to_component(component, subchange_name, subchange, change_path)
+      end
+    end
+
+    def remove_children_from_object_list(object_list, removed_changes)
+      removed_changes.each do |removed_change|
+        child = child_component_of_object_list(object_list, removed_change["displayName"])
+        if removed_change["isa"] == "PBXFileSystemSynchronizedRootGroup"
+          # A target references the buildable folder object; unlinking it must detach the reference,
+          # not unconditionally delete the shared object. `ObjectList#delete` is reference-counted:
+          # it removes the object only when this was its last referrer, so a folder still referenced
+          # by the main group or another target survives. (Full deletion of the folder itself is
+          # driven separately by its main group entry, via `apply_group_removals`.)
+          object_list.delete(child) unless child.nil?
+        else
+          remove_component(child, removed_change)
+        end
       end
     end
 
@@ -353,6 +379,10 @@ module Kintsugi
       elsif component.is_a?(Xcodeproj::Project::PBXFileReference) ||
           component.is_a?(Xcodeproj::Project::PBXGroup)
         component.hierarchy_path.delete_prefix("/")
+      elsif component.is_a?(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+        # A synchronized root group is not a `PBXGroup`, so it has no `hierarchy_path` instance
+        # method; the groupable helper computes the same path from its parent chain.
+        Xcodeproj::Project::Object::GroupableHelper.hierarchy_path(component).delete_prefix("/")
       end
     end
 
@@ -652,6 +682,13 @@ module Kintsugi
         add_file_reference(component, change, change_path)
       when "PBXGroup"
         add_group(component, change, change_path)
+      when "PBXFileSystemSynchronizedRootGroup"
+        add_file_system_synchronized_root_group(component, change, change_path)
+      when "PBXFileSystemSynchronizedBuildFileExceptionSet"
+        add_file_system_synchronized_build_file_exception_set(component, change, change_path)
+      when "PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet"
+        add_file_system_synchronized_group_build_phase_membership_exception_set(component, change,
+                                                                                change_path)
       when "PBXContainerItemProxy"
         add_container_item_proxy(component, change, change_path)
       when "PBXTargetDependency"
@@ -766,6 +803,239 @@ module Kintsugi
         raise MergeError, "Trying to add variant group to an unsupported component type " \
                           "#{containing_component.isa}. Change is: #{change}"
       end
+    end
+
+    # Known limitation: buildable folders have no stable identity in a project diff (they're
+    # compared by value), so relocating a folder between parent groups while it stays linked to a
+    # target reads as remove-from-A + add-to-B. The old object (and its target link) is removed, and
+    # the new object is created but not re-linked to the target, since the target's own change is
+    # empty. Such a merge can drop the folder's target membership; re-verify after relocating.
+    def add_file_system_synchronized_root_group(containing_component, change, change_path)
+      case containing_component
+      when Xcodeproj::Project::PBXNativeTarget
+        # The group was already created in the group tree by the main group pass. Resolve it by its
+        # position in the tree so we reuse the exact same object, even when another buildable folder
+        # shares its name in a different parent group.
+        group = resolve_file_system_synchronized_root_group(containing_component, change)
+        if group.nil?
+          raise MergeError, "No file system synchronized root group matching #{change} was " \
+                            "found in the group tree. Change path: #{change_path}"
+        end
+
+        # Dedup by object identity, not display name: one target can legitimately link several
+        # same-named folders from different parent groups, each a distinct object.
+        already_linked = containing_component.file_system_synchronized_groups.any? do |linked|
+          linked.uuid == group.uuid
+        end
+        return if !Settings.allow_duplicates && already_linked
+
+        containing_component.file_system_synchronized_groups << group
+      else
+        raise MergeError, "Trying to add file system synchronized root group to an unsupported " \
+                          "component type #{containing_component.isa}. Change is: #{change}"
+      end
+    end
+
+    def resolve_file_system_synchronized_root_group(target, change)
+      candidates = target.project.objects.select do |object|
+        object.isa == "PBXFileSystemSynchronizedRootGroup" &&
+          object.display_name == change["displayName"]
+      end
+      return candidates.first if candidates.length <= 1
+
+      # More than one buildable folder shares this name (in different parent groups). Match against
+      # the folders the change's target links in the source project, comparing hierarchy paths as
+      # strings. A folder's own `path`/`display_name` may itself contain "/", so this must not be
+      # split into segments, so path-walking helpers like `group_or_file_at_path` can't be used.
+      source_hierarchies = source_synchronized_root_group_hierarchies(target, change)
+      source_matching = candidates.select do |candidate|
+        source_hierarchies.include?(synchronized_root_group_hierarchy_path(candidate))
+      end
+      return candidates.first if source_matching.empty?
+
+      # Prefer a folder not already linked to this target, so a target linking two same-named
+      # folders resolves each addition to a distinct object rather than dropping the second.
+      linked_uuids = target.file_system_synchronized_groups.map(&:uuid)
+      source_matching.find { |candidate| !linked_uuids.include?(candidate.uuid) } ||
+        source_matching.first
+    end
+
+    # Hierarchy paths (in source order) of the buildable folders the change's target links that
+    # match `change`. A target may link several same-named folders from different parents; their
+    # identity lets us map each addition to the right destination object.
+    def source_synchronized_root_group_hierarchies(target, change)
+      source_target = find_target(@change_source_project, target.display_name)
+      (source_target&.file_system_synchronized_groups || [])
+        .select { |group| group.to_tree_hash == change }
+        .map { |group| synchronized_root_group_hierarchy_path(group) }
+        .compact
+    end
+
+    # Groupable helper raises a `RuntimeError` consistency error (rather than returning nil) for an
+    # object with no parent group; treat that as "no hierarchy" so a stray unparented candidate
+    # can't abort the merge. Narrowly rescued so unrelated errors still surface.
+    def synchronized_root_group_hierarchy_path(group)
+      Xcodeproj::Project::Object::GroupableHelper.hierarchy_path(group)
+    rescue RuntimeError
+      nil
+    end
+
+    def add_file_system_synchronized_build_file_exception_set(containing_component, change,
+                                                              change_path)
+      unless containing_component.is_a?(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+        raise MergeError, "Trying to add file system synchronized build file exception set to an " \
+                          "unsupported component type #{containing_component.isa}. Change is: " \
+                          "#{change}"
+      end
+      return if exception_set_already_exists?(containing_component, change)
+
+      exception_set = containing_component.project.new(
+        Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet
+      )
+      containing_component.exceptions << exception_set
+      add_attributes_to_component(exception_set, change, change_path, ignore_keys: ["target"])
+      resolve_or_defer_exception_reference(exception_set, :target, change["target"])
+    end
+
+    def add_file_system_synchronized_group_build_phase_membership_exception_set(
+      containing_component, change, change_path
+    )
+      unless containing_component.is_a?(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+        raise MergeError, "Trying to add file system synchronized group build phase membership " \
+                          "exception set to an unsupported component type " \
+                          "#{containing_component.isa}. Change is: #{change}"
+      end
+      return if exception_set_already_exists?(containing_component, change)
+
+      exception_set = containing_component.project.new(
+        Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+      )
+      containing_component.exceptions << exception_set
+      add_attributes_to_component(exception_set, change, change_path, ignore_keys: ["buildPhase"])
+      resolve_or_defer_exception_reference(exception_set, :build_phase, change["buildPhase"])
+    end
+
+    # `true` if an equivalent exception set already exists on `group`. This is intentionally NOT
+    # gated on `Settings.allow_duplicates`: a synchronized root group is referenced from both the
+    # main group and its target(s), so the same exception addition is visited through several graph
+    # paths, and two exception sets identical in target/build phase + membership are meaningless.
+    def exception_set_already_exists?(group, change)
+      group.exceptions.any? { |exception_set| exception_set_matches_change?(exception_set, change) }
+    end
+
+    def exception_set_matches_change?(exception_set, change)
+      signature = exception_set.to_tree_hash
+      pending = @pending_exception_references.find { |set, _, _| set.equal?(exception_set) }
+      unless pending.nil?
+        _, kind, reference = pending
+        signature = signature.merge(exception_reference_key(kind) => reference)
+      end
+      # `displayName` is derived from the (possibly still-unresolved) reference and the folder name,
+      # so it carries no information the reference key and simple attributes don't already carry;
+      # excluding it avoids a spurious mismatch when the reference is still pending (nil).
+      signature.reject { |key, _| key == "displayName" } ==
+        change.reject { |key, _| key == "displayName" }
+    end
+
+    def exception_reference_key(kind)
+      kind == :target ? "target" : "buildPhase"
+    end
+
+    # Resolves the target/build phase an exception set references. The target may be created, and
+    # the group linked to its targets, only later, so unresolvable references are recorded and
+    # retried by `resolve_pending_exception_references` after the whole change is applied. Build
+    # phase resolution always defers: it needs the group already linked to a target.
+    def resolve_or_defer_exception_reference(exception_set, kind, reference)
+      # Only the target reference is resolved eagerly (it just needs the target to exist). The build
+      # phase reference is always deferred, because the phase it points to might itself be created
+      # later in the same change (e.g. a target and its build phases added together).
+      if kind == :target
+        resolved = resolve_exception_reference(exception_set, kind, reference)
+        unless resolved.nil?
+          assign_exception_reference(exception_set, kind, resolved)
+          return
+        end
+      end
+
+      @pending_exception_references << [exception_set, kind, reference]
+    end
+
+    def resolve_pending_exception_references
+      @pending_exception_references.each do |exception_set, kind, reference|
+        resolved = resolve_exception_reference(exception_set, kind, reference)
+        if resolved.nil?
+          puts "Warning: Couldn't resolve #{kind} reference #{reference.inspect} for exception " \
+               "set '#{exception_set.display_name}'."
+          next
+        end
+
+        assign_exception_reference(exception_set, kind, resolved)
+      end
+      @pending_exception_references = []
+    end
+
+    def resolve_exception_reference(exception_set, kind, reference)
+      case kind
+      when :target
+        find_target(exception_set.project, reference)
+      when :build_phase
+        find_synchronized_group_build_phase(exception_set, reference)
+      end
+    end
+
+    def assign_exception_reference(exception_set, kind, resolved)
+      case kind
+      when :target then exception_set.target = resolved
+      when :build_phase then exception_set.build_phase = resolved
+      end
+    end
+
+    # Finds the build phase an exception set references. The reference carries its owning target,
+    # so we resolve that target by name (unique) then its build phase by name. This disambiguates
+    # same-named phases (e.g. "Sources") when the group is shared by several targets. Returns nil
+    # when the target isn't created yet, so the caller can defer.
+    def find_synchronized_group_build_phase(exception_set, reference)
+      project = exception_set.project
+      target_name = reference.is_a?(Hash) ? reference["target"] : nil
+      phase_name = reference.is_a?(Hash) ? reference["name"] : reference
+
+      candidate_targets =
+        if target_name.nil?
+          synchronized_group_referencing_targets(exception_set)
+        else
+          target = find_target(project, target_name)
+          return nil if target.nil?
+
+          [target]
+        end
+
+      matching_build_phases = candidate_targets.flat_map(&:build_phases).select do |build_phase|
+        build_phase.display_name == phase_name
+      end
+      if matching_build_phases.length > 1
+        puts "Debug: Multiple build phases named '#{phase_name}'. Using the first one."
+      end
+      matching_build_phases.first
+    end
+
+    # The targets that reference the exception set's owning synchronized root group. Used as a
+    # fallback when a build phase reference doesn't carry its owning target. The groupable helper
+    # raises `RuntimeError` for an unparented set (e.g. its group was removed earlier in the same
+    # change); fall back to all native targets rather than aborting the merge.
+    def synchronized_group_referencing_targets(exception_set)
+      project = exception_set.project
+      group =
+        begin
+          Xcodeproj::Project::Object::GroupableHelper.parent(exception_set)
+        rescue RuntimeError
+          nil
+        end
+      return project.native_targets if group.nil?
+
+      referencing_targets = project.native_targets.select do |target|
+        target.file_system_synchronized_groups.any? { |linked| linked.uuid == group.uuid }
+      end
+      referencing_targets.empty? ? project.native_targets : referencing_targets
     end
 
     def add_build_rule(target, change, change_path)
