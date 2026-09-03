@@ -126,6 +126,69 @@ module Xcodeproj
         end
       end
 
+      # Modifies `PBXFileSystemSynchronizedBuildFileExceptionSet`'s `to_tree_hash` to serialize its
+      # `target` as a reference (by display name) instead of recursing into it. Without this, the
+      # target expands into a hash that contains the synchronized root group owning this exception
+      # set, which owns this exception set, causing infinite recursion.
+      class PBXFileSystemSynchronizedBuildFileExceptionSet
+        # xcodeproj 1.27.0's `display_name` interpolates `#{target.name}`; guard against a nil target
+        # (which occurs transiently while the target reference is resolved) to avoid `NoMethodError`
+        # during serialization or tree hashing. `GroupableHelper.parent` raises (and re-interpolates
+        # `display_name`, recursing to a stack overflow) when the set has no referrers, so only call
+        # it when a parent actually exists.
+        def display_name
+          folder_name = referrers.empty? ? nil : GroupableHelper.parent(self)&.display_name
+          "Exceptions for \"#{folder_name}\" folder in \"#{target&.name}\" target"
+        end
+
+        def to_tree_hash
+          hash = { 'displayName' => display_name, 'isa' => isa }
+          self.class.simple_attributes.each do |attribute|
+            value = attribute.get_value(self)
+            hash[attribute.plist_name] = value unless value.nil?
+          end
+          hash['target'] = target.display_name if target
+          hash
+        end
+      end
+
+      # Same fix as `PBXFileSystemSynchronizedBuildFileExceptionSet`, for the build phase membership
+      # variant, whose recursing reference is `build_phase`.
+      class PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+        # xcodeproj 1.27.0's `display_name` calls `build_phase.name`, which build phases don't
+        # implement, raising `NoMethodError` on any serialization or tree hash of this object. Use
+        # the build phase's `display_name` (e.g. "Sources") instead. Also guard the parent lookup,
+        # which otherwise raises and recurses to a stack overflow when the set has no referrers.
+        def display_name
+          folder_name = referrers.empty? ? nil : GroupableHelper.parent(self)&.display_name
+          "Exceptions for \"#{folder_name}\" folder in \"#{build_phase&.display_name}\" build phase"
+        end
+
+        def to_tree_hash
+          hash = { 'displayName' => display_name, 'isa' => isa }
+          self.class.simple_attributes.each do |attribute|
+            value = attribute.get_value(self)
+            hash[attribute.plist_name] = value unless value.nil?
+          end
+          hash['buildPhase'] = build_phase_reference if build_phase
+          hash
+        end
+
+        # Serializes `build_phase` as a reference that also carries its owning target, so it can be
+        # resolved unambiguously even when the owning group is shared by multiple targets that each
+        # have a build phase with the same name (e.g. "Sources").
+        def build_phase_reference
+          reference = { 'name' => build_phase.display_name }
+          # Match by UUID: xcodeproj compares build phases by value, so `include?` would match a
+          # same-named empty phase on an unrelated target.
+          owning_target = build_phase.project.native_targets.find do |target|
+            target.build_phases.any? { |phase| phase.uuid == build_phase.uuid }
+          end
+          reference['target'] = owning_target.display_name unless owning_target.nil?
+          reference
+        end
+      end
+
       # By default, for this type, the `display_name` is used when calling `ascii_plist_annotation` (which is used
       # to serialize the project to disk). In the case where the `display_name` contains a "plugin:" prefix, which
       # means that the package is a plugin, the prefix is ommitted so just the package name is used.

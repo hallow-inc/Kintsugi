@@ -2148,6 +2148,593 @@ describe Kintsugi, :apply_change_to_project do
     end
   end
 
+  describe "file system synchronized groups" do
+    before do
+      base_project.new_target("com.apple.product-type.library.static", "foo", :ios)
+    end
+
+    def add_synchronized_root_group(project, path, source_tree: "<group>")
+      group = project.new(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+      group.source_tree = source_tree
+      group.path = path
+      project.main_group.children << group
+      group
+    end
+
+    it "adds a file system synchronized root group to the main group" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      add_synchronized_root_group(theirs_project, "SyncedSources")
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes_to_apply, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+    end
+
+    it "adds a file system synchronized root group referenced by a target" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      theirs_project.targets[0].file_system_synchronized_groups << group
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes_to_apply, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+
+      # `be_equivalent_to_project` compares tree hashes (attributes only), so it can't detect a
+      # duplicated object. Assert that the target reuses the exact same object that was created in
+      # the group tree, rather than a second root group with the same attributes.
+      synchronized_groups = base_project.objects.select do |object|
+        object.isa == "PBXFileSystemSynchronizedRootGroup"
+      end
+      expect(synchronized_groups.count).to eq(1)
+      expect(base_project.targets[0].file_system_synchronized_groups.first)
+        .to equal(synchronized_groups.first)
+    end
+
+    it "adds a synchronized root group with explicit file types and folders" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      group.explicit_file_types = {"*.md" => "text"}
+      group.explicit_folders = ["Fixtures"]
+      theirs_project.targets[0].file_system_synchronized_groups << group
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes_to_apply, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+    end
+
+    it "adds a synchronized root group with build file exceptions" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      theirs_project.targets[0].file_system_synchronized_groups << group
+      exception_set =
+        theirs_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet)
+      exception_set.target = theirs_project.targets[0]
+      exception_set.membership_exceptions = ["Excluded.swift"]
+      group.exceptions << exception_set
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes_to_apply, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+      resolved = base_project.objects.find do |object|
+        object.isa == "PBXFileSystemSynchronizedBuildFileExceptionSet"
+      end
+      expect(resolved.target).to equal(base_project.targets[0])
+    end
+
+    it "adds a synchronized root group with build phase membership exceptions" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      theirs_project.targets[0].file_system_synchronized_groups << group
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+      exception_set = theirs_project.new(klass)
+      exception_set.build_phase = theirs_project.targets[0].source_build_phase
+      exception_set.membership_exceptions = ["OnlyInSources.swift"]
+      group.exceptions << exception_set
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes_to_apply, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+    end
+
+    it "removes a file system synchronized root group" do
+      group = add_synchronized_root_group(base_project, "SyncedSources")
+      base_project.targets[0].file_system_synchronized_groups << group
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      theirs_project.main_group.children
+                    .find { |child| child.display_name == "SyncedSources" }
+                    .remove_from_project
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes_to_apply, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+      expect(base_project.objects.count { |o| o.isa == "PBXFileSystemSynchronizedRootGroup" })
+        .to eq(0)
+    end
+
+    it "unlinks a folder from one target without deleting it for the others" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      group = add_synchronized_root_group(base_project, "Shared")
+      base_project.targets.each { |target| target.file_system_synchronized_groups << group }
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      foo = theirs_project.targets.find { |target| target.display_name == "foo" }
+      foo.file_system_synchronized_groups.delete(foo.file_system_synchronized_groups.first)
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+      # The shared folder must survive: only foo's link is removed; bar keeps it and it stays in
+      # the main group (removing a target reference must not delete the shared object).
+      expect(base_project.objects.count { |o| o.isa == "PBXFileSystemSynchronizedRootGroup" })
+        .to eq(1)
+      expect(base_project.targets.find { |t| t.display_name == "foo" }
+                          .file_system_synchronized_groups).to be_empty
+      expect(base_project.targets.find { |t| t.display_name == "bar" }
+                          .file_system_synchronized_groups.count).to eq(1)
+    end
+
+    it "keeps a folder shared by three targets when one unlinks it" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      base_project.new_target("com.apple.product-type.library.static", "baz", :ios)
+      group = add_synchronized_root_group(base_project, "Shared")
+      base_project.targets.each { |target| target.file_system_synchronized_groups << group }
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      foo = theirs_project.targets.find { |target| target.display_name == "foo" }
+      foo.file_system_synchronized_groups.delete(foo.file_system_synchronized_groups.first)
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+      expect(base_project.objects.count { |o| o.isa == "PBXFileSystemSynchronizedRootGroup" })
+        .to eq(1)
+      %w[bar baz].each do |name|
+        expect(base_project.targets.find { |t| t.display_name == name }
+                            .file_system_synchronized_groups.count).to eq(1)
+      end
+    end
+
+    it "removes a folder shared by two targets and unlinks both in one change" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      group = add_synchronized_root_group(base_project, "Shared")
+      base_project.targets.each { |target| target.file_system_synchronized_groups << group }
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      theirs_project.main_group.children
+                    .find { |child| child.display_name == "Shared" }
+                    .remove_from_project
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+      expect(base_project.objects.count { |o| o.isa == "PBXFileSystemSynchronizedRootGroup" })
+        .to eq(0)
+      base_project.targets.each do |target|
+        expect(target.file_system_synchronized_groups).to be_empty
+      end
+    end
+
+    it "resolves a same-named folder when another candidate is not in the group tree" do
+      # A buildable folder linked by two targets but absent from the main group has no parent, so
+      # its hierarchy_path raises; resolution must tolerate it rather than aborting the merge.
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      groupless = base_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+      groupless.source_tree = "<group>"
+      groupless.path = "Shared"
+      base_project.targets.each { |target| target.file_system_synchronized_groups << groupless }
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      feature = theirs_project.main_group.new_group("FeatureA")
+      real_group = theirs_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+      real_group.source_tree = "<group>"
+      real_group.path = "Shared"
+      feature << real_group
+      theirs_project.targets.find { |t| t.display_name == "foo" }
+                    .file_system_synchronized_groups << real_group
+
+      changes = get_diff(theirs_project, base_project)
+      expect {
+        described_class.apply_change_to_project(base_project, changes, theirs_project)
+      }.not_to raise_error
+
+      # The new FeatureA/Shared is linked in addition to the pre-existing group-tree-less folder.
+      expect(base_project.targets.find { |t| t.display_name == "foo" }
+                          .file_system_synchronized_groups.count).to eq(2)
+    end
+
+    it "avoids adding a synchronized root group that already exists" do
+      existing_group = add_synchronized_root_group(base_project, "SyncedSources")
+      base_project.targets[0].file_system_synchronized_groups << existing_group
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      theirs_group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      theirs_project.targets[0].file_system_synchronized_groups << theirs_group
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      other_project = create_copy_of_project(base_project, "other")
+      described_class.apply_change_to_project(other_project, changes_to_apply, theirs_project)
+
+      expect(other_project).to be_equivalent_to_project(base_project)
+    end
+
+    it "resolves an exception target added in the same change" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      target = theirs_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      target.file_system_synchronized_groups << group
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet
+      exception = theirs_project.new(klass)
+      exception.target = target
+      exception.membership_exceptions = ["Excluded.swift"]
+      group.exceptions << exception
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      resolved = base_project.objects.find { |object| object.is_a?(klass) }
+      expected_target = base_project.targets.find { |item| item.name == "bar" }
+      expect(resolved.target&.uuid).to eq(expected_target.uuid)
+    end
+
+    it "resolves a build-phase exception against the correct target" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      target = theirs_project.targets.find { |item| item.name == "bar" }
+      group = add_synchronized_root_group(theirs_project, "SyncedSources")
+      target.file_system_synchronized_groups << group
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+      exception = theirs_project.new(klass)
+      exception.build_phase = target.source_build_phase
+      exception.membership_exceptions = ["OnlyInSources.swift"]
+      group.exceptions << exception
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      resolved = base_project.objects.find { |object| object.is_a?(klass) }
+      expected_phase = base_project.targets.find { |item| item.name == "bar" }.source_build_phase
+      expect(resolved.build_phase.uuid).to eq(expected_phase.uuid)
+    end
+
+    it "resolves a build-phase exception when the folder is shared by multiple targets" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "Shared")
+      theirs_project.targets.find { |item| item.display_name == "foo" }
+                    .file_system_synchronized_groups << group
+      bar = theirs_project.targets.find { |item| item.display_name == "bar" }
+      bar.file_system_synchronized_groups << group
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+      exception = theirs_project.new(klass)
+      # Reference the SECOND target's Sources phase. "foo" (added first) also references the group
+      # and has its own "Sources" phase, so a resolver scoped only to the referencing targets would
+      # pick foo's phase instead of bar's.
+      exception.build_phase = bar.source_build_phase
+      exception.membership_exceptions = ["OnlyInBarSources.swift"]
+      group.exceptions << exception
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+      resolved = base_project.objects.find { |object| object.is_a?(klass) }
+      expected_phase = base_project.targets.find { |item| item.name == "bar" }.source_build_phase
+      expect(resolved.build_phase.uuid).to eq(expected_phase.uuid)
+    end
+
+    it "attaches the correct folder when two buildable folders share a name" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      theirs_project = create_copy_of_project(base_project, "theirs")
+
+      feature_a = theirs_project.main_group.new_group("FeatureA")
+      feature_b = theirs_project.main_group.new_group("FeatureB")
+      group_a = theirs_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+      group_a.source_tree = "<group>"
+      group_a.path = "Shared"
+      feature_a << group_a
+      group_b = theirs_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup)
+      group_b.source_tree = "<group>"
+      group_b.path = "Shared"
+      feature_b << group_b
+      theirs_project.targets.find { |item| item.display_name == "foo" }
+                    .file_system_synchronized_groups << group_a
+      theirs_project.targets.find { |item| item.display_name == "bar" }
+                    .file_system_synchronized_groups << group_b
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+
+      helper = Xcodeproj::Project::Object::GroupableHelper
+      foo_group = base_project.targets.find { |item| item.display_name == "foo" }
+                              .file_system_synchronized_groups.first
+      bar_group = base_project.targets.find { |item| item.display_name == "bar" }
+                              .file_system_synchronized_groups.first
+      expect(helper.hierarchy_path(foo_group)).to eq("/FeatureA/Shared")
+      expect(helper.hierarchy_path(bar_group)).to eq("/FeatureB/Shared")
+    end
+
+    it "does not duplicate an exception set added on both sides" do
+      group = add_synchronized_root_group(base_project, "Models")
+      base_project.targets[0].file_system_synchronized_groups << group
+      common_base = create_copy_of_project(base_project, "base")
+
+      add_build_file_exception = lambda do |project|
+        synchronized_group = project.objects.find do |object|
+          object.isa == "PBXFileSystemSynchronizedRootGroup"
+        end
+        exception = project.new(Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet)
+        exception.target = project.targets.find { |target| target.display_name == "foo" }
+        exception.membership_exceptions = ["Excluded.swift"]
+        synchronized_group.exceptions << exception
+      end
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      add_build_file_exception.call(theirs_project)
+      add_build_file_exception.call(base_project)
+
+      changes = get_diff(theirs_project, common_base)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      exception_count = base_project.objects.count do |object|
+        object.isa == "PBXFileSystemSynchronizedBuildFileExceptionSet"
+      end
+      expect(exception_count).to eq(1)
+    end
+
+    it "does not duplicate a deferred exception added to an existing buildable folder" do
+      group = add_synchronized_root_group(base_project, "Models")
+      base_project.targets[0].file_system_synchronized_groups << group
+      common_base = create_copy_of_project(base_project, "base")
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      synchronized_group = theirs_project.objects.find do |object|
+        object.isa == "PBXFileSystemSynchronizedRootGroup"
+      end
+      exception = theirs_project.new(klass)
+      exception.build_phase = theirs_project.targets[0].source_build_phase
+      exception.membership_exceptions = ["Excluded.swift"]
+      synchronized_group.exceptions << exception
+
+      changes = get_diff(theirs_project, common_base)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      # The build-phase reference is resolved lazily, so the exception travels both the main-group
+      # and the target graph paths with a still-unresolved reference; dedup must recognize it.
+      expect(base_project.objects.count { |object| object.is_a?(klass) }).to eq(1)
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+    end
+
+    it "attaches the correct slashed-path folder when two share a name" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      theirs_project = create_copy_of_project(base_project, "theirs")
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup
+      feature_a = theirs_project.main_group.new_group("FeatureA")
+      feature_b = theirs_project.main_group.new_group("FeatureB")
+      group_a = theirs_project.new(klass)
+      group_a.source_tree = "<group>"
+      group_a.path = "Sub/Shared"
+      feature_a << group_a
+      group_b = theirs_project.new(klass)
+      group_b.source_tree = "<group>"
+      group_b.path = "Sub/Shared"
+      feature_b << group_b
+      theirs_project.targets.find { |item| item.display_name == "foo" }
+                    .file_system_synchronized_groups << group_a
+      theirs_project.targets.find { |item| item.display_name == "bar" }
+                    .file_system_synchronized_groups << group_b
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      helper = Xcodeproj::Project::Object::GroupableHelper
+      foo_group = base_project.targets.find { |item| item.display_name == "foo" }
+                              .file_system_synchronized_groups.first
+      bar_group = base_project.targets.find { |item| item.display_name == "bar" }
+                              .file_system_synchronized_groups.first
+      expect(helper.hierarchy_path(foo_group)).to eq("/FeatureA/Sub/Shared")
+      expect(helper.hierarchy_path(bar_group)).to eq("/FeatureB/Sub/Shared")
+    end
+
+    it "serializes a build file exception set with an unset target without crashing" do
+      group = add_synchronized_root_group(base_project, "Models")
+      exception =
+        base_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet)
+      group.exceptions << exception
+
+      expect { exception.to_tree_hash }.not_to raise_error
+      expect(exception.to_tree_hash["displayName"])
+        .to eq("Exceptions for \"Models\" folder in \"\" target")
+    end
+
+    it "serializes an exception set with no parent group without infinite recursion" do
+      exception =
+        base_project.new(Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet)
+
+      expect { exception.to_tree_hash }.not_to raise_error
+    end
+
+    it "serializes a parent-less build-phase exception set without infinite recursion" do
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+      exception = base_project.new(klass)
+
+      expect { exception.to_tree_hash }.not_to raise_error
+      expect(exception.to_tree_hash["displayName"])
+        .to eq("Exceptions for \"\" folder in \"\" build phase")
+    end
+
+    it "links both folders when one target references two folders sharing a name" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      target = theirs_project.targets.find { |item| item.display_name == "foo" }
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedRootGroup
+      %w[FeatureA FeatureB].each do |feature|
+        parent = theirs_project.main_group.new_group(feature)
+        group = theirs_project.new(klass)
+        group.source_tree = "<group>"
+        group.path = "Shared"
+        parent << group
+        target.file_system_synchronized_groups << group
+      end
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      helper = Xcodeproj::Project::Object::GroupableHelper
+      linked = base_project.targets.find { |item| item.display_name == "foo" }
+                           .file_system_synchronized_groups
+      expect(linked.map { |group| helper.hierarchy_path(group) })
+        .to contain_exactly("/FeatureA/Shared", "/FeatureB/Shared")
+    end
+
+    it "keeps exception sets that differ only by target" do
+      base_project.new_target("com.apple.product-type.library.static", "bar", :ios)
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "Models")
+      theirs_project.targets.each { |target| target.file_system_synchronized_groups << group }
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet
+      %w[foo bar].each do |target_name|
+        exception = theirs_project.new(klass)
+        exception.target = theirs_project.targets.find { |t| t.display_name == target_name }
+        exception.membership_exceptions = ["Excluded.swift"]
+        group.exceptions << exception
+      end
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project.objects.count { |object| object.is_a?(klass) }).to eq(2)
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+    end
+
+    it "keeps exception sets that differ only by membership" do
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      group = add_synchronized_root_group(theirs_project, "Models")
+      theirs_project.targets[0].file_system_synchronized_groups << group
+
+      klass = Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet
+      %w[A B].each do |suffix|
+        exception = theirs_project.new(klass)
+        exception.target = theirs_project.targets[0]
+        exception.membership_exceptions = ["Excluded#{suffix}.swift"]
+        group.exceptions << exception
+      end
+
+      changes = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+      expect(base_project.objects.count { |object| object.is_a?(klass) }).to eq(2)
+      expect(base_project).to be_equivalent_to_project(theirs_project)
+    end
+
+    it "recreates a synchronized root group modified on theirs and deleted on ours" do
+      allow(Kintsugi::ConflictResolver).to receive(:create_nonexistent_component_when_changing_it?)
+        .and_return(true)
+
+      group = add_synchronized_root_group(base_project, "Models")
+      base_project.targets[0].file_system_synchronized_groups << group
+      common_base = create_copy_of_project(base_project, "base")
+
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      theirs_project.objects.find { |object| object.isa == "PBXFileSystemSynchronizedRootGroup" }
+                    .explicit_folders = ["Generated"]
+
+      base_project.objects.find { |object| object.isa == "PBXFileSystemSynchronizedRootGroup" }
+                  .remove_from_project
+
+      changes = get_diff(theirs_project, common_base)
+      expect {
+        described_class.apply_change_to_project(base_project, changes, theirs_project)
+      }.not_to raise_error
+
+      recreated =
+        base_project.objects.find { |object| object.isa == "PBXFileSystemSynchronizedRootGroup" }
+      expect(recreated&.explicit_folders).to eq(["Generated"])
+    end
+
+    context "when duplicates are allowed" do
+      before { Kintsugi::Settings.allow_duplicates = true }
+
+      after { Kintsugi::Settings.allow_duplicates = false }
+
+      it "adds a synchronized root group that already exists" do
+        existing_group = add_synchronized_root_group(base_project, "SyncedSources")
+        base_project.targets[0].file_system_synchronized_groups << existing_group
+
+        theirs_project = create_copy_of_project(base_project, "theirs")
+        theirs_group = add_synchronized_root_group(theirs_project, "SyncedSources")
+        theirs_project.targets[0].file_system_synchronized_groups << theirs_group
+
+        changes_to_apply = get_diff(theirs_project, base_project)
+        other_project = create_copy_of_project(base_project, "other")
+        described_class.apply_change_to_project(other_project, changes_to_apply, theirs_project)
+
+        expect(other_project.targets[0].file_system_synchronized_groups.count).to eq(2)
+      end
+
+      it "still does not duplicate an exception on an existing folder" do
+        group = add_synchronized_root_group(base_project, "Models")
+        base_project.targets[0].file_system_synchronized_groups << group
+        common_base = create_copy_of_project(base_project, "base")
+
+        klass = Xcodeproj::Project::PBXFileSystemSynchronizedBuildFileExceptionSet
+        theirs_project = create_copy_of_project(base_project, "theirs")
+        synchronized_group = theirs_project.objects.find do |object|
+          object.isa == "PBXFileSystemSynchronizedRootGroup"
+        end
+        exception = theirs_project.new(klass)
+        exception.target = theirs_project.targets[0]
+        exception.membership_exceptions = ["Excluded.swift"]
+        synchronized_group.exceptions << exception
+
+        changes = get_diff(theirs_project, common_base)
+        described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+        # The two-pass traversal visits the same source exception twice; that artifact must be
+        # suppressed even when duplicates are allowed (an identical exception set is meaningless).
+        expect(base_project.objects.count { |object| object.is_a?(klass) }).to eq(1)
+      end
+
+      it "still does not duplicate a deferred build-phase exception on an existing folder" do
+        group = add_synchronized_root_group(base_project, "Models")
+        base_project.targets[0].file_system_synchronized_groups << group
+        common_base = create_copy_of_project(base_project, "base")
+
+        klass = Xcodeproj::Project::PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet
+        theirs_project = create_copy_of_project(base_project, "theirs")
+        synchronized_group = theirs_project.objects.find do |object|
+          object.isa == "PBXFileSystemSynchronizedRootGroup"
+        end
+        exception = theirs_project.new(klass)
+        exception.build_phase = theirs_project.targets[0].source_build_phase
+        exception.membership_exceptions = ["Excluded.swift"]
+        synchronized_group.exceptions << exception
+
+        changes = get_diff(theirs_project, common_base)
+        described_class.apply_change_to_project(base_project, changes, theirs_project)
+
+        expect(base_project.objects.count { |object| object.is_a?(klass) }).to eq(1)
+      end
+    end
+  end
+
   def create_copy_of_project(project, new_project_prefix)
     copied_project_path = make_temp_directory(new_project_prefix, ".xcodeproj")
     project.save(copied_project_path)
