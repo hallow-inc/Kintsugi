@@ -744,9 +744,23 @@ module Kintsugi
     end
 
     def add_swift_package_product_dependency(containing_component, change, change_path)
+      project = containing_component.project
       swift_package_product_dependency =
-        containing_component.project.new(Xcodeproj::Project::XCSwiftPackageProductDependency)
+        project.new(Xcodeproj::Project::XCSwiftPackageProductDependency)
       add_attributes_to_component(swift_package_product_dependency, change, change_path)
+
+      # Within a single target, the target's `packageProductDependencies` entry and the `productRef`
+      # of the build file that links the product are the same object. The diff adds it from both
+      # places, so reuse an equivalent dependency already present in the SAME target rather than
+      # adding a duplicate. The reuse is scoped to the target because Xcode keeps a separate
+      # dependency object per target.
+      target = owning_native_target(containing_component)
+      existing_dependency =
+        existing_package_product_dependency(target, swift_package_product_dependency)
+      unless existing_dependency.nil?
+        swift_package_product_dependency.remove_from_project
+        swift_package_product_dependency = existing_dependency
+      end
 
       case containing_component
       when Xcodeproj::Project::PBXBuildFile
@@ -756,6 +770,35 @@ module Kintsugi
       else
         raise MergeError, "Trying to add swift package product dependency to an unsupported " \
                           "component type #{containing_component.isa}. Change is: #{change}"
+      end
+    end
+
+    # The native target that owns `component`: the target itself, or -- for a build file -- the
+    # target whose build phases contain it. Returns nil if none (e.g. the build phase is not yet
+    # linked to a target), in which case the caller adds a fresh dependency.
+    def owning_native_target(component)
+      return component if component.is_a?(Xcodeproj::Project::PBXNativeTarget)
+      return nil unless component.is_a?(Xcodeproj::Project::PBXBuildFile)
+
+      component.project.native_targets.find do |target|
+        # Match by object identity, not `include?` (which compares by value): a freshly-created
+        # build file is still attribute-less here, and `PBXBuildFile#==` would treat it as equal to
+        # any other attribute-less build file, wrongly attributing it to an earlier target.
+        target.build_phases.any? do |build_phase|
+          build_phase.files.any? { |file| file.equal?(component) }
+        end
+      end
+    end
+
+    # An existing package product dependency of `target` (either in its `packageProductDependencies`
+    # or referenced by one of its build files) equivalent to `dependency`, or nil if there is none.
+    def existing_package_product_dependency(target, dependency)
+      return nil if target.nil?
+
+      candidates = target.package_product_dependencies.to_a +
+                   target.build_phases.flat_map(&:files).map(&:product_ref).compact
+      candidates.uniq.find do |candidate|
+        !candidate.equal?(dependency) && candidate.to_tree_hash == dependency.to_tree_hash
       end
     end
 
@@ -1084,14 +1127,24 @@ module Kintsugi
     end
 
     def add_build_file(build_phase, change, change_path)
-      if change["fileRef"].nil?
-        puts "Warning: Trying to add a build file without any file reference to build phase " \
-             "'#{build_phase}'"
+      # A build file references either a file (`fileRef`) or a Swift package product (`productRef`).
+      if change["fileRef"].nil? && change["productRef"].nil?
+        puts "Warning: Trying to add a build file without any file or product reference to build " \
+             "phase '#{build_phase}'"
         return
       end
 
       existing_build_file = build_phase.files.find do |build_file|
-        build_file.file_ref && build_file.file_ref.path == change["fileRef"]["path"]
+        if change["fileRef"]
+          build_file.file_ref && build_file.file_ref.path == change["fileRef"]["path"]
+        else
+          # Compare the whole product reference, not just its name: two different Swift package
+          # products (from different packages) may share a product name, so a name-only match would
+          # wrongly drop a distinct build file. Comparing the full tree hash also distinguishes
+          # nameless products by their package.
+          build_file.product_ref &&
+            build_file.product_ref.to_tree_hash == change["productRef"]
+        end
       end
       return if !Settings.allow_duplicates && !existing_build_file.nil?
 
