@@ -2452,6 +2452,40 @@ describe Kintsugi, :apply_change_to_project do
       expect(base_project.targets[0].file_system_synchronized_groups.first).to equal(folders.first)
     end
 
+    it "doesn't create a dangling build file when the referenced file is in a buildable folder" do
+      # Base: a normal group "Routines" with a file, plus the target's Sources build phase.
+      routines = base_project.main_group.new_group("Routines")
+      routines.new_file("Routines/Routine.swift")
+
+      # Theirs: links the file into the Sources build phase, i.e. adds an explicit `PBXBuildFile`
+      # whose `fileRef` points at Routines/Routine.swift.
+      theirs_project = create_copy_of_project(base_project, "theirs")
+      theirs_routine = theirs_project.main_group.children
+                                     .find { |child| child.display_name == "Routines" }
+                                     .files.first
+      theirs_project.targets[0].source_build_phase.add_file_reference(theirs_routine)
+
+      # Ours: converts the "Routines" group into an Xcode 16 buildable folder, so the file no longer
+      # exists as an explicit, navigable reference -- its hierarchy path now traverses the folder.
+      ours_project = create_copy_of_project(base_project, "ours")
+      ours_project.main_group.children
+                  .find { |child| child.display_name == "Routines" }
+                  .remove_from_project
+      folder = add_synchronized_root_group(ours_project, "Routines")
+      ours_project.targets[0].file_system_synchronized_groups << folder
+
+      changes_to_apply = get_diff(theirs_project, base_project)
+      described_class.apply_change_to_project(ours_project, changes_to_apply, theirs_project)
+
+      # Resolving the added build file's `fileRef` against `ours` returns nil (the path traverses a
+      # buildable folder), so Kintsugi must not leave behind a build file with neither a file nor a
+      # product reference -- such an entry is inert cruft the build ignores.
+      dangling_build_files = ours_project.objects.select do |object|
+        object.isa == "PBXBuildFile" && object.file_ref.nil? && object.product_ref.nil?
+      end
+      expect(dangling_build_files).to be_empty
+    end
+
     it "converts a group with nested children into a file system synchronized root group" do
       routines = base_project.main_group.new_group("Routines")
       routines.new_file("Routines/Routine.swift")
