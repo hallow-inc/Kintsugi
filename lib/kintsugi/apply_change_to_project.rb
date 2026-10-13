@@ -1267,6 +1267,22 @@ module Kintsugi
       build_file = build_phase.project.new(Xcodeproj::Project::PBXBuildFile)
       build_phase.files << build_file
       add_attributes_to_component(build_file, change, change_path)
+
+      # Applying the attributes above resolves the build file's `fileRef` (or `productRef`) against
+      # the project being modified. If it didn't resolve, the build file is left referencing neither
+      # a file nor a product. A common cause is the referenced file now living inside an Xcode 16
+      # buildable folder (`PBXFileSystemSynchronizedRootGroup`), whose contents are implicit, with
+      # no navigable reference; an unresolvable reference proxy or variant group reaches here too.
+      # Such an entry is inert (the build ignores it) regardless of cause, so drop it instead of
+      # leaving dangling cruft behind in the project.
+      return unless build_file.file_ref.nil? && build_file.product_ref.nil?
+
+      reference = change.dig("fileRef", "path") || change.dig("fileRef", "name") ||
+                  change["displayName"] || "<unknown>"
+      puts "Warning: Removing build file for '#{reference}' from build phase " \
+           "'#{build_phase}': its file or product reference couldn't be resolved in the " \
+           "project (it may now be inside an Xcode buildable folder, whose contents are implicit)."
+      build_phase.remove_build_file(build_file)
     end
 
     def find_variant_group(project, display_name)
